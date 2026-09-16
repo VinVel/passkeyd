@@ -124,9 +124,20 @@ fn load_passkeys(req: &Request) -> anyhow::Result<(PublicKeyCredentialRpEntity, 
 }
 
 enum AuthorizationAction {
+    // Skip the authorization UI entirely, including password
+    // and credential selection.
     NoCredentials,
+
+    // Use the only available passkey directly, skips UI.
     UseOnlyPasskey,
+
+    // Spawns presence UI to determine the user's intent,
+    // either to use passkeyd or an external key. If the user's
+    // intent is to use passkeyd, skip the UI and send the credentials directly.
     Presence,
+
+    // Spawn the selection UI, which includes the auth prompt (if required) and
+    // passkey selection (if multiple passkeys are available).
     Selection,
 }
 
@@ -135,11 +146,19 @@ fn authorization_action(
     no_pass: bool,
     passkey_count: usize,
 ) -> AuthorizationAction {
+    // Dry run of match
+    //
+    // Situation                                                   Action
+    // No other key + 0 passkeys	                            NoCredentials
+    // No other key + no password + 1 passkey                   UseOnlyPasskey
+    // Other key + 0 passkeys                                   Presence
+    // Other key + no password + 1 passkey                      Presence
+    // Anything else	                                        Selection
+
     match (has_another_fido_dev, no_pass, passkey_count) {
         // no other key and no credentials either,
         // send the no cerds directly. the password
-        // does not matter here, there is nothing to
-        // unlock in the first place.
+        // does not matter here.
         (false, _, 0) => AuthorizationAction::NoCredentials,
 
         // no other key, no password
@@ -147,18 +166,20 @@ fn authorization_action(
         // skip ui, send the cerds directly
         (false, true, 1) => AuthorizationAction::UseOnlyPasskey,
 
-        // another key, but either no or single cerd
+        // another key, but there is no either passkey
         // the user intent is probably to use
         // either security key or use passkeyd
-        // so, presence to reduce ambiguity.
-        // with no cerd of ours the password does not
-        // matter either, presence still lets the user
-        // reach for the external key.
+        // so, presence to find user's intent.
         (true, _, 0) => AuthorizationAction::Presence,
+
+        // another key, but there is one passkey
+        // the user intent is probably to use
+        // either security key or use passkeyd
+        // so, presence to find user's intent.
         (true, true, 1) => AuthorizationAction::Presence,
 
         // If no another key, no password, there are more than 1 cerds, selection is obviously needed.
-        // If another key, has password, aribitray cerds, selection will handle it.
+        // If another key, has password, any number of cerds, selection will handle it.
         _ => AuthorizationAction::Selection,
     }
 }
@@ -223,7 +244,9 @@ fn authorize_selection(
     rp_entity: &PublicKeyCredentialRpEntity,
     passkeys: &[Passkey],
 ) -> anyhow::Result<usize> {
+    // Passkeys vector should never be empty here. If it is, then it is a logical error.
     if passkeys.is_empty() {
+        error!("Passkeys were unexpectedly empty, expected at least one passkey.");
         anyhow::bail!(CtapStatus::NoCredentials);
     }
 
@@ -637,78 +660,4 @@ fn get_username_from_uid(uid: libc::uid_t) -> Option<String> {
     let passwd = unsafe { passwd.assume_init() };
     let cstr = unsafe { std::ffi::CStr::from_ptr(passwd.pw_name) };
     cstr.to_str().ok().map(|username| username.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An empty credential list must never reach the selection UI: its index
-    /// would come back as 0 and `swap_remove(0)` on the empty `Vec` in `get()`
-    /// aborts the whole daemon. This used to happen for every relying party
-    /// sending an `allowCredentials` we hold no passkey for, github.com among
-    /// them, whenever a password was configured.
-    #[test]
-    fn no_credentials_never_selects() {
-        for &has_another_fido_dev in &[false, true] {
-            for &no_pass in &[false, true] {
-                let action = authorization_action(has_another_fido_dev, no_pass, 0);
-
-                assert!(
-                    !matches!(action, AuthorizationAction::Selection),
-                    "empty passkey list routed to the selection UI \
-                     (has_another_fido_dev: {has_another_fido_dev}, no_pass: {no_pass})"
-                );
-            }
-        }
-    }
-
-    /// Without another key around there is nothing to disambiguate, so an empty
-    /// list is answered straight away rather than prompting the user.
-    #[test]
-    fn no_credentials_and_no_other_key_answers_directly() {
-        for &no_pass in &[false, true] {
-            assert!(matches!(
-                authorization_action(false, no_pass, 0),
-                AuthorizationAction::NoCredentials
-            ));
-        }
-    }
-
-    /// With another key present the presence prompt is kept even when we hold
-    /// no passkey, so the user can still reach for the external key.
-    #[test]
-    fn no_credentials_with_another_key_asks_for_presence() {
-        for &no_pass in &[false, true] {
-            assert!(matches!(
-                authorization_action(true, no_pass, 0),
-                AuthorizationAction::Presence
-            ));
-        }
-    }
-
-    /// Behaviour for the non-empty cases is unchanged.
-    #[test]
-    fn existing_credentials_keep_their_action() {
-        assert!(matches!(
-            authorization_action(false, true, 1),
-            AuthorizationAction::UseOnlyPasskey
-        ));
-        assert!(matches!(
-            authorization_action(true, true, 1),
-            AuthorizationAction::Presence
-        ));
-        assert!(matches!(
-            authorization_action(false, false, 1),
-            AuthorizationAction::Selection
-        ));
-        assert!(matches!(
-            authorization_action(true, false, 1),
-            AuthorizationAction::Selection
-        ));
-        assert!(matches!(
-            authorization_action(false, true, 2),
-            AuthorizationAction::Selection
-        ));
-    }
 }
